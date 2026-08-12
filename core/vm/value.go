@@ -2,7 +2,7 @@ package vm
 
 import (
 	"github.com/holiman/uint256"
-	"github.com/ethereum/go-ethereum/substrate_parser/ast"
+	"github.com/seonghojj/substrate_parser/ast"
 )
 
 const (

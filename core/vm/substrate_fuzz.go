@@ -13,8 +13,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/research"
 
-	"github.com/ethereum/go-ethereum/ContractFuzzer/fuzz"
-	"github.com/ethereum/go-ethereum/substrate_parser/ast"
+	"github.com/seonghojj/ContractFuzzer/fuzz"
+	"github.com/seonghojj/substrate_parser/ast"
 )
 
 type Coverage fuzz.Coverage

@@ -16,7 +16,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ethereum/go-ethereum/substrate_parser/ast"
+	"github.com/seonghojj/substrate_parser/ast"
 
 	"sync"
 	"sync/atomic"
@@ -156,10 +156,14 @@ type SubstrateInterpreter struct {
 	Delta *DeltaSemantics
 }
 
-var useDelta bool
+const (
+	useDeltaGas  = true
+	useDeltaLOG  = true
+	useDeltaFMP  = true
+	useDeltaProp = true
+)
 
 func NewSubstrateInterpreter(evm *EVM, cfg Config) *SubstrateInterpreter {
-	useDelta = false
 	return &SubstrateInterpreter{
 		evm:          evm,
 		callContexts: make([]*callCtx_s, 0, 1024),
@@ -173,6 +177,18 @@ func NewSubstrateInterpreter(evm *EVM, cfg Config) *SubstrateInterpreter {
 func getMD5(code []byte) string {
 	md5result := md5.Sum([]byte(code))
 	return hex.EncodeToString(md5result[:])
+}
+
+// combine flags into a 2-bit state (high: bit 1, low: bit 0)
+func makeState(high, low bool) int {
+	state := 0
+	if high {
+		state |= 2
+	}
+	if low {
+		state |= 1
+	}
+	return state
 }
 
 // /////////////////////////////
@@ -201,6 +217,8 @@ func (in *SubstrateInterpreter) Run(contract *Contract, input []byte, readOnly b
 
 	// Increment the call depth which is restricted to 1024
 	in.evm.depth++
+	in.Delta.SubstrateTrace.CallTraces[in.evm.Config.IsolationIndex].Depth = int32(in.evm.depth)
+
 	defer func() { in.evm.depth-- }()
 
 	// Make sure the readOnly is only set if we aren't in readOnly yet.
@@ -290,6 +308,8 @@ func (in *SubstrateInterpreter) Run(contract *Contract, input []byte, readOnly b
 		v := recover()
 
 		if len(in.callContexts) == 1 {
+			callTrace := in.Delta.RecordedTrace.CallTraces[in.evm.Config.IsolationIndex]
+
 			hexInput := "0x"
 			if len(input) > 4 {
 				hexInput += hex.EncodeToString(input[0:4])
@@ -306,12 +326,12 @@ func (in *SubstrateInterpreter) Run(contract *Contract, input []byte, readOnly b
 				output += strings.Replace(fmt.Sprint(v), ",", "", -1)
 			}
 			output += in.framePtr.panicMsg
-			output += fmt.Sprintf(",%d,%d,%d,%d",
+			output += fmt.Sprintf(",%d,%d,%d,%d,%02b,%02b",
 				len(in.evm.StateDB.(*state.StateDB).ResearchEVMTrace.CallTraces), len(in.Delta.RecordedTrace.CallTraces),
-				in.Delta.SubstrateTrace.SstoreCount, in.Delta.RecordedTrace.SstoreCount)
+				in.Delta.SubstrateTrace.SstoreCount, in.Delta.RecordedTrace.SstoreCount,
+				makeState(in.checkOutOfGas(), in.Delta.IsEVMOutOfGas(in.evm.Config.IsolationIndex)),
+				makeState(err == nil, callTrace.Err == nil))
 			in.Delta.SubstrateResult = output
-
-			callTrace := in.Delta.RecordedTrace.CallTraces[in.evm.Config.IsolationIndex]
 
 			//TODO:For comparison
 			output += fmt.Sprintf(",%d,%d", contract.Gas-callTrace.LeftOverGas, len(contract.Code))
@@ -319,6 +339,10 @@ func (in *SubstrateInterpreter) Run(contract *Contract, input []byte, readOnly b
 
 			contract.UseGas(contract.Gas - callTrace.LeftOverGas)
 			in.evm.StateDB.AddRefund(callTrace.RefundGas - in.evm.StateDB.GetRefund())
+
+			////
+			//fmt.Println(in.Delta.SubstrateTrace.CallTraces[in.cfg.IsolationIndex].SHA3IndexList, in.Delta.SubstrateTrace.CallTraces[in.cfg.IsolationIndex].SHA3HashToIndex)
+			//fmt.Println(in.evm.Config.EVMTrace.CallTraces[in.cfg.IsolationIndex].SHA3IndexList, in.evm.Config.EVMTrace.CallTraces[in.cfg.IsolationIndex].SHA3HashToIndex)
 		}
 
 	}()
@@ -336,8 +360,8 @@ func (in *SubstrateInterpreter) Run(contract *Contract, input []byte, readOnly b
 				//Unintended termination
 			} else if t == 2 { //Intended termination (e.g., out-of-gas error in EVM)
 				v = nil
-				if useDelta {
-					err = in.Delta.RecordedTrace.CallTraces[0].Err
+				if useDeltaGas {
+					err = in.Delta.RecordedTrace.CallTraces[in.evm.Config.IsolationIndex].Err
 				}
 			}
 			if v != nil {
@@ -411,10 +435,24 @@ func revert(ret []byte) NodeValue {
 	return NodeValue{kind: ValueRevert, value: ret}
 }
 
-func (in *SubstrateInterpreter) getHash(a []byte) *uint256.Int {
+func (in *SubstrateInterpreter) getHash(a []byte, traceSHA3 bool) *uint256.Int {
 	in.hasher.Reset()
 	in.hasher.Write(a)
 	in.hasher.Read(in.hasherBuf[:])
+
+	// check deviation of SHA3 compared to EVM trace
+	if traceSHA3 && in.evm.Config.EVMTrace != nil {
+		if in.checkOutOfGas() {
+			return nil
+		}
+		if in.evm.checkSHA3Deviation(in.cfg.IsolationIndex, in.hasherBuf) {
+			line, _ := in.currNode.GetPos()
+			in.Panic("Deviated in SHA3 at line "+strconv.Itoa(line), in.currNode, false)
+		}
+		// substrate-evm-trace: add SHA3 instruction return values
+		in.Delta.SubstrateTrace.CallTraces[in.cfg.IsolationIndex].AddSHA3InstRet(in.hasherBuf)
+	}
+
 	return uint256.NewInt(0).SetBytes(in.hasherBuf[:])
 }
 
@@ -473,7 +511,8 @@ func (in *SubstrateInterpreter) keccak256(args NodeValue) *uint256.Int {
 		hashKey = tmp[:]
 	}
 	printDebug("hashkey: "+hex.EncodeToString(hashKey), false)
-	return in.getHash(hashKey)
+
+	return in.getHash(hashKey, true)
 }
 
 func abiEncodeErrorMessage(errorMessage string) []byte {
@@ -646,7 +685,7 @@ func (in *SubstrateInterpreter) checkOutOfGas() bool {
 		in.Delta.AllocCount--
 	}
 
-	if in.Delta.CheckOutOfGas() {
+	if in.Delta.CheckOutOfGas(in.evm.Config.IsolationIndex) {
 		atomic.StoreInt32(&in.framePtr.terminate, 2)
 		return true
 	}
@@ -669,7 +708,19 @@ func (in *SubstrateInterpreter) sstore(loc, val *uint256.Int) {
 	defer func() {
 		in.checkOutOfGas()
 	}()
+
+	// check deviation of storage compared to EVM trace
+	if in.evm.Config.EVMTrace != nil {
+		if in.evm.checkSstoreDeviation(in.framePtr.contract.Address(), loc, val) {
+			line, _ := in.currNode.GetPos()
+			in.Panic("Deviated in sstore at line "+strconv.Itoa(line), in.currNode, false)
+		}
+	}
+
 	in.evm.StateDB.SetState(in.framePtr.contract.Address(), common.Hash(loc.Bytes32()), common.Hash(val.Bytes32()))
+
+	t := fmt.Sprintf("%s,%s,%s", in.framePtr.contract.Address(), loc.Hex(), val.Hex())
+	in.Delta.SubstrateTrace.AddSstoreTrace(t)
 	in.Delta.SubstrateTrace.IncSstoreCount()
 
 	str := fmt.Sprintf("INT: address %s, loc: %s, value: %s, depth: %d", in.framePtr.contract.Address().Hex(), loc.Hex(), common.Hash(val.Bytes32()).Hex(), in.evm.depth)
@@ -696,11 +747,23 @@ func (in *SubstrateInterpreter) sstoreRef(loc storageRef, val *uint256.Int) {
 	sloadBytes := in.evm.StateDB.GetState(in.framePtr.contract.Address(), common.Hash(index.Bytes32()))
 	valBytes := val.Bytes32()
 	copy(sloadBytes[31-loc.bit_end:32-loc.bit_start], valBytes[31-(loc.bit_end-loc.bit_start):32])
+	mergedVal := uint256.NewInt(0).SetBytes(sloadBytes[:])
 
-	in.evm.StateDB.SetState(in.framePtr.contract.Address(), common.Hash(index.Bytes32()), common.Hash(sloadBytes))
+	// check deviation of storage compared to EVM trace
+	if in.evm.Config.EVMTrace != nil {
+		if in.evm.checkSstoreDeviation(in.framePtr.contract.Address(), index, mergedVal) {
+			line, _ := in.currNode.GetPos()
+			in.Panic("Deviated in sstoreRef at line "+strconv.Itoa(line), in.currNode, false)
+		}
+	}
+
+	in.evm.StateDB.SetState(in.framePtr.contract.Address(), common.Hash(index.Bytes32()), common.Hash(mergedVal.Bytes32()))
+
+	t := fmt.Sprintf("%s,%s,%s", in.framePtr.contract.Address(), index.Hex(), mergedVal.Hex())
+	in.Delta.SubstrateTrace.AddSstoreTrace(t)
 	in.Delta.SubstrateTrace.IncSstoreCount()
 
-	str := fmt.Sprintf("INR: address %s, loc: %s, value: %s, depth: %d", in.framePtr.contract.Address().Hex(), index.Hex(), sloadBytes.Hex(), in.evm.depth)
+	str := fmt.Sprintf("INR: address %s, loc: %s, value: %s, depth: %d", in.framePtr.contract.Address().Hex(), index.Hex(), mergedVal.Hex(), in.evm.depth)
 	printDebug(str, checkEMI)
 }
 
@@ -825,7 +888,7 @@ func (in *SubstrateInterpreter) getUint256(v NodeValue) (u *uint256.Int) {
 			if acc.member == "length" {
 				u = in.sloadRef(acc.id)
 			} else if acc.member == "data" {
-				u = in.getHash(uint256.NewInt(0).Set(acc.id.index).PaddedBytes(32))
+				u = in.getHash(uint256.NewInt(0).Set(acc.id.index).PaddedBytes(32), true)
 			} else if acc.member == "code.size" {
 				addr := in.sloadRef(acc.id)
 				u = uint256.NewInt(uint64(in.evm.StateDB.GetCodeSize(addr.Bytes20())))
@@ -1148,7 +1211,7 @@ func (in *SubstrateInterpreter) getMemBytes(ref *memoryRef) (b []byte) {
 }
 func (in *SubstrateInterpreter) getFreeMemPtr(byteLen uint64, update bool) *uint256.Int {
 	currLast := uint256.NewInt(0).SetBytes(in.framePtr.memory.GetPtr(memLast, 32))
-	if update && useDelta {
+	if update && useDeltaFMP {
 		newLast := uint256.NewInt(0).AddUint64(currLast, byteLen)
 		in.framePtr.memory.Set32(memLast, newLast)
 	}

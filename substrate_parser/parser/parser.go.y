@@ -1,6 +1,6 @@
 %{
    package parser
-   import . "github.com/ethereum/go-ethereum/substrate_parser/ast"
+   import . "github.com/seonghojj/substrate_parser/ast"
 %}
 %token COMMENT
 %token MESSAGE

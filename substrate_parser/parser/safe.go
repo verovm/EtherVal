@@ -6,7 +6,7 @@ import (
 
 	lru "github.com/hashicorp/golang-lru"
 
-	"github.com/ethereum/go-ethereum/substrate_parser/ast"
+	"github.com/seonghojj/substrate_parser/ast"
 )
 
 var (

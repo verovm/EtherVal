@@ -7,7 +7,14 @@ import (
 	"github.com/holiman/uint256"
 )
 
-const EnablePatching = true
+// TODO: alternative policies for PHI
+const (
+	EnablePatch_ParameterName = true
+	EnablePatch_Reorder       = true
+	EnablePatch_Fallthrough   = true
+	EnablePatch_PHI           = true // true: most recently assigned var, false: always first arg
+	EnablePatch_AmbiguousJump = true
+)
 
 // Transformer encode AstProgram into an executable format TACProgram
 // Each TACProgram contains several TACFunctions
@@ -38,7 +45,22 @@ type TACFunction struct {
 	UniqueJumpVarSucc map[int][]string // JUMP_VAR instruction idx to list of successor block names
 	VariableEncoding  map[string]int   // map variable name into an idx
 
-	bookkeeping map[int]*AstStatement // bookkeeping all insturctions that need to be filled later
+	// Track instructions with semantic issues
+	AmbiguousJumpAddr map[int]bool      // Addresses of ambiguous jump instructions (regardless of patches)
+	VariableBlock     map[string]string // Variable definitions to block names
+	AmbiguousPhiAddr  map[int]bool      // Addresses of ambiguous PHI instructions (regardless of patches)
+	ReorderConstAddr  map[int]bool      // Addresses of CONST instructions to reorder
+	ReorderPhiAddr    map[int]bool      // Addresses of PHI instructions to reorder
+
+	// Track instructions added from fallthrough semantics patch
+	FallthroughStopAddr  map[int]bool // Addresses of STOP from fallthrough semantics patch
+	FallthroughJumpAddr  map[int]bool // Addresses of JUMP from fallthrough semantics patch
+	FallthroughThrowAddr map[int]bool // Addresses of THROW from fallthrough semantics patch
+
+	// Track choices that make PHI instructions ambiguous
+	AmbiguousPhiChoice map[int]map[int]bool // map[phiAddr][regIndex]
+
+	bookkeeping map[int]*AstStatement // bookkeeping all instructions that need to be filled later
 
 	AstFunc *AstFunction
 }
@@ -52,9 +74,21 @@ func newTACFunction(prog *TACProgram, astFunc *AstFunction) TACFunction {
 		BlockByIndex:      make(map[int]string),
 		UniqueBlockAddr:   make(map[string]int),
 		UniqueJumpVarSucc: make(map[int][]string),
+		VariableEncoding:  make(map[string]int),
 
-		VariableEncoding: make(map[string]int),
-		bookkeeping:      make(map[int]*AstStatement),
+		AmbiguousJumpAddr: make(map[int]bool),
+		VariableBlock:     make(map[string]string),
+		AmbiguousPhiAddr:  make(map[int]bool),
+		ReorderConstAddr:  make(map[int]bool),
+		ReorderPhiAddr:    make(map[int]bool),
+
+		FallthroughStopAddr:  make(map[int]bool),
+		FallthroughJumpAddr:  make(map[int]bool),
+		FallthroughThrowAddr: make(map[int]bool),
+
+		AmbiguousPhiChoice: make(map[int]map[int]bool),
+
+		bookkeeping: make(map[int]*AstStatement),
 
 		AstFunc: astFunc,
 	}
@@ -95,7 +129,7 @@ func (f *TACFunction) encode_var(astVar *AstVariable) int {
 		}
 		// add constant into constant symbol
 		idx = f.add_var(astVar.name)
-		// trim leading 0 from hex number, this is just to make the parser to be more forgiveable
+		// trim leading 0 from hex number, this is just to make the parser to be more forgivable
 		hex := astVar.val[2:]
 		for len(hex) > 1 && hex[0] == '0' {
 			hex = hex[1:]
@@ -151,14 +185,27 @@ func shiftVarDecls(ast *AstProgram) *AstProgram {
 			block := &function.blocks[block_idx]
 			varDeclStmt := make([]AstStatement, 0)
 			others := make([]AstStatement, 0)
-			for _, stmt := range block.statements {
+
+			for i, stmt := range block.statements {
 				if isVariableDecl(&stmt) {
 					varDeclStmt = append(varDeclStmt, stmt)
+
+					// Track var decl stmt when reorder patch will change their addresses
+					if j := len(varDeclStmt) - 1; i != j {
+						// Infeasible to analyze mutability of struct from arrays and pointers
+						// Just set patch_reorder flag for all possible statement instances
+						stmt.patch_reorder = true
+						block.statements[i].patch_reorder = true
+						varDeclStmt[j].patch_reorder = true
+					}
 				} else {
 					others = append(others, stmt)
 				}
 			}
-			block.statements = append(varDeclStmt, others...)
+
+			if EnablePatch_Reorder {
+				block.statements = append(varDeclStmt, others...)
+			}
 		}
 	}
 	return ast
@@ -237,8 +284,8 @@ func addMissingJump(ast *AstProgram) *AstProgram {
 				lastStmt := block.statements[len(block.statements)-1]
 				if lastStmt.operation != JUMP && lastStmt.operation != JUMPI {
 					// If last statement does not end with a JUMP or JUMPI
-					// we cannot determine the fallthrough semantic, insert an artifcial THROW
-					// TODO speicalied throw for error report
+					// we cannot determine the fallthrough semantic, insert an artificial THROW
+					// TODO specialized throw for error report
 					block.statements = append(block.statements, AstStatement{
 						address:      "auxiliary",
 						operation:    THROW,
@@ -280,17 +327,15 @@ func addMissingJump(ast *AstProgram) *AstProgram {
 }
 
 func TransformProgram(ast *AstProgram) *TACProgram {
-	if EnablePatching {
-		// Patch: Shift CONST and PHI to the start of the block
-		ast = shiftVarDecls(ast)
-	}
+	// Patch: Shift CONST and PHI to the start of the block
+	ast = shiftVarDecls(ast)
 
-	if EnablePatching {
+	if EnablePatch_Fallthrough {
 		// Patch: Add missing STOP for blocks with empty succ
 		ast = addMissingStop(ast)
 	}
 
-	if EnablePatching {
+	if EnablePatch_Fallthrough {
 		// Patch: Add missing JUMP to fix fallthrough semantics and empty blocks
 		ast = addMissingJump(ast)
 	}
@@ -332,7 +377,7 @@ func transform_function(astFunc *AstFunction, prog *TACProgram) TACFunction {
 	// encode each arguments for function
 	astFunc.is_public = function.IsPublic
 	for _, arg := range astFunc.args {
-		if EnablePatching {
+		if EnablePatch_ParameterName {
 			// Patch: Fix wrong parameter names
 			if !strings.HasPrefix(arg, "v") {
 				arg = render_var(arg)
@@ -359,6 +404,17 @@ func transform_function(astFunc *AstFunction, prog *TACProgram) TACFunction {
 
 	visited[&astFunc.blocks[0]] = true
 	get_visit_order(&astFunc.blocks[0])
+
+	// variable definitions and block names
+	for _, block := range order {
+		for _, stmt := range block.statements {
+			for _, arg := range stmt.args[:stmt.num_assignee] {
+				function.VariableBlock[arg.name] = block.name
+			}
+		}
+	}
+
+	// transform blocks
 	for _, block := range order {
 		function.add_block(block)
 	}
@@ -376,9 +432,9 @@ func transform_function(astFunc *AstFunction, prog *TACProgram) TACFunction {
 		}
 	}
 
-	// Fillup address encoding
+	// Fill up address encoding
 	for pc, stmt := range function.bookkeeping {
-		switch function.Insts[pc] {
+		switch opcode := function.Insts[pc]; opcode {
 		case TAC_JUMP, TAC_JUMPI:
 			destIdx := pc + 1
 			function.Insts[destIdx] = -1
@@ -386,7 +442,21 @@ func transform_function(astFunc *AstFunction, prog *TACProgram) TACFunction {
 			block := astFunc.get_block(stmt.block_name)
 			baseAddr := stmt.args[0].val
 
-			if EnablePatching {
+			// Track ambiguous jump instructions
+			if countBlockBaseAddr[baseAddr] >= 2 {
+				function.AmbiguousJumpAddr[pc] = true
+			}
+			for i, name := range block.successor {
+				if opcode == TAC_JUMPI && i == 0 {
+					// Ignore fallthrough edge of JUMPI
+					continue
+				}
+				if countBlockBaseAddr[BaseAddr(name)] >= 2 {
+					function.AmbiguousJumpAddr[pc] = true
+				}
+			}
+
+			if EnablePatch_AmbiguousJump {
 				// Patch: Fix ambiguous jump addresses with succ
 				dests := []int{}
 				for _, name := range block.successor {
@@ -407,10 +477,22 @@ func transform_function(astFunc *AstFunction, prog *TACProgram) TACFunction {
 				continue
 			}
 		case TAC_JUMP_VAR, TAC_JUMPI_VAR:
-			if EnablePatching {
+			// Track ambiguous jump var instructions
+			block := astFunc.get_block(stmt.block_name)
+			for i, name := range block.successor {
+				if opcode == TAC_JUMPI_VAR && i == 0 {
+					// Ignore fallthrough edge of JUMPI_VAR
+					continue
+				}
+				if countBlockBaseAddr[BaseAddr(name)] >= 2 {
+					function.AmbiguousJumpAddr[pc] = true
+				}
+			}
+
+			if EnablePatch_AmbiguousJump {
 				// Patch: Fix ambiguous jump var addresses with succ
 				countSuccBaseAddr := make(map[string]int)
-				for _, name := range astFunc.get_block(stmt.block_name).successor {
+				for _, name := range block.successor {
 					countSuccBaseAddr[BaseAddr(name)]++
 				}
 				for name, count := range countSuccBaseAddr {
@@ -443,23 +525,66 @@ func (f *TACFunction) add_block(block *AstBlock) {
 	// collect all CONST and PHI statements
 	var const_statements []*AstStatement
 	var phi_statements []*AstStatement
+
+	// Track reordering CONST and PHI statements while collecting
 	for i, stmt := range block.statements {
-		switch stmt.operation {
-		case CONST:
+		if stmt.operation == CONST {
 			const_statements = append(const_statements, &block.statements[i])
-		case PHI:
+			if j := len(const_statements) - 1; i != j {
+				stmt.patch_reorder = true
+				block.statements[i].patch_reorder = true
+				const_statements[j].patch_reorder = true
+			}
+		}
+	}
+	for i, stmt := range block.statements {
+		if stmt.operation == PHI {
 			phi_statements = append(phi_statements, &block.statements[i])
+			if j := len(phi_statements) - 1; i != len(const_statements)+j {
+				stmt.patch_reorder = true
+				block.statements[i].patch_reorder = true
+				phi_statements[j].patch_reorder = true
+			}
 		}
 	}
 
-	// insert all found CONST statements at the start of the block
-	if len(const_statements) > 0 {
-		for i := range const_statements {
-			trans_const(f, const_statements[i])
+	if EnablePatch_Reorder {
+		// insert all found CONST statements at the start of the block
+		if len(const_statements) > 0 {
+			for i := range const_statements {
+				trans_const(f, const_statements[i])
+			}
+		}
+
+		// insert all found PHI statements at the start of the block
+		if len(phi_statements) > 0 {
+			trans_phi_statements(f, phi_statements)
+		}
+
+		// translate all other statements
+		for i, stmt := range block.statements {
+			if stmt.operation != CONST && stmt.operation != PHI {
+				transformer_dispatcher(f, &block.statements[i])
+			}
+		}
+	} else {
+		// transform statements in order without shifting
+		for i, stmt := range block.statements {
+			switch stmt.operation {
+			case CONST:
+				trans_const(f, &block.statements[i])
+			case PHI:
+				trans_phi_statements(f, []*AstStatement{&block.statements[i]})
+			default:
+				transformer_dispatcher(f, &block.statements[i])
+			}
 		}
 	}
 
-	// insert all found PHI statements at the start of the block
+}
+
+func trans_phi_statements(f *TACFunction, phi_statements []*AstStatement) {
+	// Surround PHI statements with PHI_START and PHI_END
 	if len(phi_statements) > 0 {
 		f.Insts = append(f.Insts, TAC_PHI_START)
 		f.Insts = append(f.Insts, len(phi_statements))
@@ -471,30 +596,57 @@ func (f *TACFunction) add_block(block *AstBlock) {
 
 		f.Insts = append(f.Insts, TAC_PHI_END)
 	}
-
-	// translate all other statements
-	for i, stmt := range block.statements {
-		if stmt.operation != CONST && stmt.operation != PHI {
-			transformer_dispatcher(f, &block.statements[i])
-		}
-	}
-
 }
 
 func trans_phi(f *TACFunction, s *AstStatement) {
+	phiAddr := len(f.Insts)
+	// Track ambiguous PHI instructions
+	argBlockCount := make(map[string]int)
+	ambiArgBlock := make(map[string]bool)
+	for _, arg := range s.args[1:] {
+		b := f.VariableBlock[arg.name]
+		argBlockCount[b]++
+	}
+	for b, count := range argBlockCount {
+		if count >= 2 {
+			ambiArgBlock[b] = true
+		}
+	}
+	for _, is_ambi := range ambiArgBlock {
+		if is_ambi {
+			f.AmbiguousPhiAddr[phiAddr] = true
+			break
+		}
+	}
+
+	// Track PHI instructions to reorder
+	f.ReorderPhiAddr[phiAddr] = s.patch_reorder
+	// Initialize map for ambiguous PHI arguments
+	f.AmbiguousPhiChoice[phiAddr] = make(map[int]bool)
+
 	// New format: PHI num_choice dest v1 v2 .. vn
 	f.Insts = append(f.Insts, TAC_PHI)
 	// only single choice without patching
 	f.Insts = append(f.Insts, 1)
 	f.Insts = append(f.Insts, f.encode_var(&s.args[0])) // dest
 	f.Insts = append(f.Insts, f.encode_var(&s.args[1])) // first choice
+	// Track if first choice is ambiguous
+	if arg := s.args[1]; ambiArgBlock[f.VariableBlock[arg.name]] {
+		choiceIdx := f.Insts[len(f.Insts)-1]
+		f.AmbiguousPhiChoice[phiAddr][choiceIdx] = true
+	}
 
-	if EnablePatching {
+	if EnablePatch_PHI {
 		// Patch: Allow multiple choices for PHI nodes
 		// TAC interpreter will choose the most recently assigned variable
 		f.Insts[len(f.Insts)-3] = len(s.args) - 1
 		for _, arg := range s.args[2:] {
 			f.Insts = append(f.Insts, f.encode_var(&arg))
+			// Track ambiguous PHI choices
+			if ambiArgBlock[f.VariableBlock[arg.name]] {
+				choiceIdx := f.Insts[len(f.Insts)-1]
+				f.AmbiguousPhiChoice[phiAddr][choiceIdx] = true
+			}
 		}
 	}
 }
@@ -504,16 +656,27 @@ func trans_illphi(f *TACFunction, s *AstStatement) {
 }
 
 func trans_const(f *TACFunction, s *AstStatement) {
+	// Track CONST instructions to reorder
+	f.ReorderConstAddr[len(f.Insts)] = s.patch_reorder
+
 	// We need to execute CONST to update variable cycles for PHI
 	f.Insts = append(f.Insts, TAC_CONST)
 	f.push_variables(1, s.args)
 }
 
 func trans_throw(f *TACFunction, s *AstStatement) {
+	// Track THROW from fallthrough semantics patch
+	if s.address == "auxiliary" {
+		f.FallthroughThrowAddr[len(f.Insts)] = true
+	}
 	f.Insts = append(f.Insts, TAC_THROW)
 }
 
 func trans_stop(f *TACFunction, s *AstStatement) {
+	// Track STOP from fallthrough semantics patch
+	if s.address == "auxiliary" {
+		f.FallthroughStopAddr[len(f.Insts)] = true
+	}
 	f.Insts = append(f.Insts, TAC_STOP)
 }
 
@@ -808,6 +971,10 @@ func trans_sstore(f *TACFunction, s *AstStatement) {
 
 // JUMPI target(address) cond(var)
 func trans_jumpi(f *TACFunction, s *AstStatement) {
+	// Track JUMP from fallthrough semantics patch
+	if s.address == "auxiliary" {
+		f.FallthroughJumpAddr[len(f.Insts)] = true
+	}
 	// see comment in trans_jump
 	f.bookkeeping[len(f.Insts)] = s
 	if s.args[0].typ == CONSTANT {

@@ -23,6 +23,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/research"
 )
 
 type InterpreterMode int
@@ -58,6 +59,9 @@ type Config struct {
 	// Contract isolation for cross-contract validation
 	IsolationMode  InterpreterMode
 	IsolationIndex int
+
+	// Trace recorded by EVM execution, used for deviation analysis
+	EVMTrace *research.EVMTrace
 }
 
 // ScopeContext contains the things that are per-call, such as stack and memory,

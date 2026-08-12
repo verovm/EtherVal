@@ -35,6 +35,12 @@ func init() {
 		validate.ValidateSubstrateTxCommand,
 		validate.ValidateTacCommand,
 		validate.ValidateTacTxCommand,
+		validate.DbCloneTraceCommand,
+		validate.DetectSubstrateDeviationCommand,
+		validate.DetectSubstrateDeviationTxCommand,
+		validate.DetectDeviationTacCommand,
+		validate.DetectDeviationTacTxCommand,
+		validate.StatTxErrCommand,
 	}
 	for _, command := range app.Commands {
 		if command.Category == "" {

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/ethereum/go-ethereum/substrate_parser/ast"
+	"github.com/seonghojj/substrate_parser/ast"
 )
 
 var buffer, prevBuffer ItemSymType

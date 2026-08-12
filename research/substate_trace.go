@@ -21,18 +21,22 @@ type EVMCallTrace struct {
 
 	Depth       int32  // Depth of call stack
 	Ret         []byte // Return data of CALL/CREATE
+	CallGas     uint64 // Initial gas provided at the start
 	RefundGas   uint64 // Gas to be returned at the end of the transaction
 	LeftOverGas uint64 // leftOverGas returned by EVM's *Call* and Create* methods
 	Err         error  `json:"-"` // nil if the call is successful, ErrExecutionReverted if the call reverted
 	ErrMsg      string //
 	Reverted    bool   // true if Err is ErrExectuionReverted
 
-	GasInstRet []uint64 // Return values of GAS instructions
+	GasInstRet []uint64     `json:",omitempty"` // Return values of GAS instructions
+	LogInstRet []*types.Log `json:",omitempty"` // Return values of LOG* instructions
 
-	LogInstRet []*types.Log // Return values of LOG* instructions
+	SHA3HashToIndex map[common.Hash]int `json:",omitempty"` // mapping of return values of SHA3 instructions to indexes
+	SHA3IndexToHash map[int]common.Hash `json:"-"`          // mapping of indexes to return values of SHA3 instructions
+	SHA3IndexList   []int               `json:",omitempty"` // list of indexes of return values of SHA3 instructions
 
-	JumpInstPos    []uint64      // addresses of JUMP, JUMPI instructions
-	JumpInstTarget []uint256.Int // target addresses of JUMP, JUMPI instructinos jumped in runtime
+	JumpInstPos    []uint64      `json:",omitempty"` // addresses of JUMP, JUMPI instructions
+	JumpInstTarget []uint256.Int `json:",omitempty"` // target addresses of JUMP, JUMPI instructinos jumped in runtime
 }
 
 func NewEVMCallTrace() *EVMCallTrace {
@@ -55,11 +59,15 @@ func (x *EVMCallTrace) Equal(y *EVMCallTrace) bool {
 		x.CallFn == y.CallFn &&
 		x.Depth == y.Depth &&
 		bytes.Equal(x.Ret, y.Ret) &&
+		x.CallGas == y.CallGas &&
 		x.LeftOverGas == y.LeftOverGas &&
 		(x.Err == y.Err || (x.Err != nil && y.Err != nil && x.Err.Error() == y.Err.Error())) &&
 		x.Reverted == y.Reverted &&
 		len(x.GasInstRet) == len(y.GasInstRet) &&
 		len(x.LogInstRet) == len(y.LogInstRet) &&
+		len(x.SHA3HashToIndex) == len(y.SHA3HashToIndex) &&
+		len(x.SHA3IndexToHash) == len(y.SHA3IndexToHash) &&
+		len(x.SHA3IndexList) == len(y.SHA3IndexList) &&
 		len(x.JumpInstPos) == len(y.JumpInstPos) &&
 		len(x.JumpInstTarget) == len(y.JumpInstTarget))
 	if !equal {
@@ -88,6 +96,25 @@ func (x *EVMCallTrace) Equal(y *EVMCallTrace) bool {
 			if xt != yt {
 				return false
 			}
+		}
+	}
+
+	for h, xi := range x.SHA3HashToIndex {
+		if yi, ok := y.SHA3HashToIndex[h]; !ok || xi != yi {
+			return false
+		}
+	}
+
+	for i, xh := range x.SHA3IndexToHash {
+		if yh, ok := y.SHA3IndexToHash[i]; !ok || xh != yh {
+			return false
+		}
+	}
+
+	for i, xi := range x.SHA3IndexList {
+		yi := x.SHA3IndexList[i]
+		if xi != yi {
+			return false
 		}
 	}
 
@@ -120,6 +147,7 @@ func (ct *EVMCallTrace) Copy() *EVMCallTrace {
 
 	ctCopy.Depth = ct.Depth
 	ctCopy.Ret = ct.Ret
+	ctCopy.CallGas = ct.CallGas
 	ctCopy.LeftOverGas = ct.LeftOverGas
 	ctCopy.Err = ct.Err
 	ctCopy.Reverted = ct.Reverted
@@ -142,6 +170,19 @@ func (ct *EVMCallTrace) Copy() *EVMCallTrace {
 		ctCopy.LogInstRet[i] = lCopy
 	}
 
+	ctCopy.SHA3HashToIndex = make(map[common.Hash]int, len(ct.SHA3HashToIndex))
+	for h, i := range ct.SHA3HashToIndex {
+		ctCopy.SHA3HashToIndex[h] = i
+	}
+
+	ctCopy.SHA3IndexToHash = make(map[int]common.Hash, len(ct.SHA3IndexToHash))
+	for i, h := range ct.SHA3IndexToHash {
+		ctCopy.SHA3IndexToHash[i] = h
+	}
+
+	ctCopy.SHA3IndexList = make([]int, len(ct.SHA3IndexList))
+	copy(ctCopy.SHA3IndexList, ct.SHA3IndexList)
+
 	ctCopy.JumpInstPos = make([]uint64, len(ct.JumpInstPos))
 	copy(ctCopy.JumpInstPos, ct.JumpInstPos)
 
@@ -157,6 +198,26 @@ func (ct *EVMCallTrace) AddGasInstRet(gas uint64) {
 
 func (ct *EVMCallTrace) AddLogInstRet(log *types.Log) {
 	ct.LogInstRet = append(ct.LogInstRet, log)
+}
+
+func (ct *EVMCallTrace) AddSHA3InstRet(h common.Hash) {
+	hCopy := common.BytesToHash(h[:])
+	if ct.SHA3HashToIndex == nil {
+		ct.SHA3HashToIndex = make(map[common.Hash]int)
+	}
+	if ct.SHA3IndexToHash == nil {
+		ct.SHA3IndexToHash = make(map[int]common.Hash)
+	}
+	if _, ok := ct.SHA3HashToIndex[hCopy]; !ok {
+		i := len(ct.SHA3HashToIndex)
+		ct.SHA3HashToIndex[hCopy] = i
+		ct.SHA3IndexToHash[i] = hCopy
+	}
+	ct.SHA3IndexList = append(ct.SHA3IndexList, ct.SHA3HashToIndex[hCopy])
+}
+
+func (ct *EVMCallTrace) GetSHA3InstRetAt(i int) common.Hash {
+	return ct.SHA3IndexToHash[ct.SHA3IndexList[i]]
 }
 
 func (ct *EVMCallTrace) AddJumpInstPosTarget(instPos uint64, target uint256.Int) {
@@ -253,13 +314,17 @@ func (et *EVMTrace) NextCallTrace() *EVMCallTrace {
 	return ct
 }
 
-func HasEVMTrace(block uint64, tx int) bool {
+func (db *SubstateDB) HasEVMTrace(block uint64, tx int) bool {
 	key := Stage2EVMTraceKey(block, tx)
-	has, _ := staticSubstateDB.backend.Has(key)
+	has, _ := db.backend.Has(key)
 	return has
 }
 
-func GetEVMTrace(block uint64, tx int) *EVMTrace {
+func HasEVMTrace(block uint64, tx int) bool {
+	return staticSubstateDB.HasEVMTrace(block, tx)
+}
+
+func (db *SubstateDB) GetEVMTrace(block uint64, tx int) *EVMTrace {
 	var err error
 
 	key := Stage2EVMTraceKey(block, tx)
@@ -269,7 +334,7 @@ func GetEVMTrace(block uint64, tx int) *EVMTrace {
 		}
 	}()
 
-	value, err := staticSubstateDB.backend.Get(key)
+	value, err := db.backend.Get(key)
 	if err != nil {
 		return nil
 	}
@@ -285,10 +350,23 @@ func GetEVMTrace(block uint64, tx int) *EVMTrace {
 		}
 	}
 
+	for _, ct := range evmTrace.CallTraces {
+		if ct.SHA3HashToIndex != nil {
+			ct.SHA3IndexToHash = make(map[int]common.Hash, len(ct.SHA3HashToIndex))
+			for h, i := range ct.SHA3HashToIndex {
+				ct.SHA3IndexToHash[i] = h
+			}
+		}
+	}
+
 	return &evmTrace
 }
 
-func PutEVMTrace(block uint64, tx int, et *EVMTrace) {
+func GetEVMTrace(block uint64, tx int) *EVMTrace {
+	return staticSubstateDB.GetEVMTrace(block, tx)
+}
+
+func (db *SubstateDB) PutEVMTrace(block uint64, tx int, et *EVMTrace) {
 	var err error
 
 	key := Stage2EVMTraceKey(block, tx)
@@ -308,16 +386,24 @@ func PutEVMTrace(block uint64, tx int, et *EVMTrace) {
 		panic(err)
 	}
 
-	err = staticSubstateDB.backend.Put(key, value)
+	err = db.backend.Put(key, value)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func PutEVMTrace(block uint64, tx int, et *EVMTrace) {
+	staticSubstateDB.PutEVMTrace(block, tx, et)
+}
+
+func (db *SubstateDB) DeleteEVMTrace(block uint64, tx int) {
+	key := Stage2EVMTraceKey(block, tx)
+	err := db.backend.Delete(key)
 	if err != nil {
 		panic(err)
 	}
 }
 
 func DeleteEVMTrace(block uint64, tx int) {
-	key := Stage2EVMTraceKey(block, tx)
-	err := staticSubstateDB.backend.Delete(key)
-	if err != nil {
-		panic(err)
-	}
+	staticSubstateDB.DeleteEVMTrace(block, tx)
 }

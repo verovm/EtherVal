@@ -16,17 +16,20 @@ var (
 		nil:                   "PASSED",
 		TACInconsistentResult: "FAILED",
 
-		vm.ErrTACParseError: "TACParseError",
-		vm.ErrTACPanic:      "TACPanic",
-		vm.ErrTACTimeout:    "TACTimeout",
+		vm.ErrTACThrow: "TACThrowErr",
 
-		vm.ErrTACIllJump:    "IllJumpTx",
+		vm.ErrTACNoTac:      "NoTacTx",
 		vm.ErrTACIllPhiExec: "IllPhiTx",
-		vm.ErrTACThrow:      "TACThrowErr",
+		vm.ErrTACIllJump:    "IllJumpTx",
+		vm.ErrTACAmbiJump:   "AmbiJumpTx",
 
-		vm.ErrTACNoTac:       "NoTacTx",
-		vm.ErrTACNoGasTrace:  "GasTraceErr",
-		vm.ErrTACNoCallTrace: "CallTraceErr",
+		vm.ErrTACNoCallTrace:   "CallTraceErr",
+		vm.ErrTACNoGasTrace:    "GasTraceErr",
+		vm.ErrTACMissingGasSem: "MissingGasSem",
+
+		vm.ErrTACTimeout:    "TACTimeout",
+		vm.ErrTACPanic:      "TACPanic",
+		vm.ErrTACParseError: "TACParseError",
 	}
 )
 

@@ -40,6 +40,8 @@ type AstStatement struct {
 	// phi_mapping  []Pair // phi_mapping is a pair of (string, AstVariable)
 	num_assignee int
 	block_name   string
+
+	patch_reorder bool
 }
 
 // AstBlock is a basic control block representation

@@ -60,11 +60,22 @@ func SetSubstateFlags(ctx *cli.Context) {
 
 	substrateDir = ctx.String(SubstrateDirFlag.Name)
 	contractIso = ctx.Bool(ContractIsolationFlag.Name)
+	if ctx.IsSet(IsolationIndexFlag.Name) {
+		isoIndex = ctx.Int(IsolationIndexFlag.Name)
+	} else {
+		isoIndex = -1
+	}
 	debugSubstrate = ctx.Bool(DebugSubstrateFlag.Name)
 	slowTxCalls = ctx.Int(SlowTxCallsFlag.Name)
 	skipSlowTxs = ctx.Bool(SkipSlowTxsFlag.Name)
+	skipInternalTxs = ctx.Bool(SkipInternalTxsFlag.Name)
+	runOutOfGas = ctx.Bool(RunOutOfGasFlag.Name)
 	fmt.Printf("substrate-interpreter: --substratedir=%s, --iso-emi=%v, --debug=%v\n", substrateDir, contractIso, debugSubstrate)
-	fmt.Printf("substrate-interpreter: --slow-tx-calls=%v --skip-slow-txs=%v\n", slowTxCalls, skipSlowTxs)
+	fmt.Printf("substrate-interpreter: --slow-tx-calls=%v --skip-slow-txs=%v, --skip-internal-txs=%v, --out-of-gas=%v\n", slowTxCalls, skipSlowTxs, skipInternalTxs, runOutOfGas)
+
+	if !contractIso && skipInternalTxs {
+		fmt.Printf("substrate-interpreter: Ignore --skip-internal-txs=%v because --iso-emi=%v\n", skipInternalTxs, contractIso)
+	}
 
 	//fuzzNum = ctx.Int(FuzzNFlag.Name)
 	//noFuzz = ctx.Bool(NoFuzzFlag.Name)

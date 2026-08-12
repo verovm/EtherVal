@@ -26,65 +26,137 @@ import (
 
 // DeltaSemantics contains recorded traces and substrate traces
 type DeltaSemantics struct {
-	MaxGas       uint64
-	MaxInstCount int64
+	MaxGas uint64
 
 	// Information recorded from EVM
 	RecordedTrace      *research.EVMTrace
 	RecordedAllocCount int
 
 	// SubstrateInterpreter and TACInterpreter
-	SubstrateTrace     *research.EVMTrace
-	AllocCount         int
-	UsedEVM            bool
-	SubstrateResult    string
-	SubstrateErr       error
-	SubstrateInstCount int64
+	SubstrateTrace  *research.EVMTrace
+	AllocCount      int
+	UsedEVM         bool
+	SubstrateResult string
+	SubstrateErr    error
+
+	TACStats // Embedding struct only for TAC interpreter
+}
+
+type TACStats struct {
+	// TACInterpreter instruction count
+	TACMaxInstCount int64 // TACInterpreter instruction count limit
+	TACInstCount    int64 // TACInterpreter dynamic instruction count
+
+	// TACInterpreter patched instructions
+	TACStopCount            int64
+	TACFallthroughStopCount int64 // fallthrough semantics patch
+	// JUMP
+	TACJumpCount            int64
+	TACFallthroughJumpCount int64 // fallthrough semantics patch
+	TACAmbiguousJumpCount   int64 // ambiguous jump patch
+	// THROW
+	TACThrowCount            int64
+	TACFallthroughThrowCount int64 // fallthrough semantics patch
+	// CONST
+	TACConstCount        int64
+	TACReorderConstCount int64 // reordering patch
+	// PHI
+	TACPhiCount                int64
+	TACReorderPhiCount         int64 // reordering patch
+	TACAmbiguousPhiCount       int64 // phi patch
+	TACAmbiguousPhiChoiceCount int64 // count ambiguous PHI choices at runtime
+
+	// Deviation point for debugging decompiler
+	TACDeviation string
 }
 
 func NewDeltaSemantics(evm *EVM, substate *research.Substate, trace *research.EVMTrace) *DeltaSemantics {
-	maxInstCount := tacMaxInstCountValue
+	tacMaxInstCount := tacMaxInstCountValue
 	if tacGasInstCountValue {
 		txGasUsage := int64(*substate.Result.GasUsed)
-		if maxInstCount < txGasUsage {
-			maxInstCount = txGasUsage
+		if tacMaxInstCount < txGasUsage {
+			tacMaxInstCount = txGasUsage
 		}
 	}
+
 	return &DeltaSemantics{
-		MaxGas:       EXT_DEFAULT_MAX_GAS,
-		MaxInstCount: maxInstCount,
+		MaxGas: EXT_DEFAULT_MAX_GAS,
 
 		RecordedTrace:      trace,
 		RecordedAllocCount: SubstatePreAllocCount(substate),
 
-		SubstrateTrace:     evm.StateDB.(*state.StateDB).ResearchEVMTrace,
-		AllocCount:         0,
-		UsedEVM:            false,
-		SubstrateResult:    "",
-		SubstrateErr:       nil,
-		SubstrateInstCount: 0,
+		SubstrateTrace:  evm.StateDB.(*state.StateDB).ResearchEVMTrace,
+		AllocCount:      0,
+		UsedEVM:         false,
+		SubstrateResult: "",
+		SubstrateErr:    nil,
+
+		TACStats: TACStats{
+			TACMaxInstCount: tacMaxInstCount,
+		},
 	}
 }
 
-func (delta *DeltaSemantics) CheckOutOfGas() bool {
+func (delta *DeltaSemantics) IsEVMOutOfGas(index int) bool {
+	recErr := delta.RecordedTrace.CallTraces[index].Err
+	if recErr == nil || recErr.Error() != ErrOutOfGas.Error() {
+		return false
+	} else {
+		return true
+	}
+}
+
+func (delta *DeltaSemantics) CheckOutOfGas(currIdx int) bool {
 	recTrace := delta.RecordedTrace
 	subTrace := delta.SubstrateTrace
 
-	i := len(subTrace.CallTraces) - 1
-	if i >= len(recTrace.CallTraces) {
+	if len(subTrace.CallTraces) > len(recTrace.CallTraces) ||
+		recTrace.CallTraces[currIdx].Depth != subTrace.CallTraces[currIdx].Depth {
 		return false
 	}
 
-	recErr := recTrace.CallTraces[i].Err
+	recErr := recTrace.CallTraces[currIdx].Err
 	if recErr == nil || recErr.Error() != ErrOutOfGas.Error() {
 		return false
 	}
 
+	// Check for equivalent sub-calltree by callLen
+	callLen := currIdx + 1
+	for callLen < len(recTrace.CallTraces) {
+		if recTrace.CallTraces[callLen].Depth <= subTrace.CallTraces[currIdx].Depth {
+			break
+		}
+		callLen++
+	}
+	if len(subTrace.CallTraces) != callLen {
+		return false
+	}
+
 	if recTrace.SstoreCount <= subTrace.SstoreCount && // number of SSTOREs
-		len(recTrace.EventTraces) <= len(subTrace.EventTraces) && // number of LOGs
-		delta.RecordedAllocCount <= delta.AllocCount { // number of addresses
+		len(recTrace.EventTraces) <= len(subTrace.EventTraces) { // number of LOGs
+		//delta.RecordedAllocCount <= delta.AllocCount { // number of addresses
+
+		if currIdx >= len(recTrace.CallTraces) || currIdx >= len(subTrace.CallTraces) {
+			return false
+		}
+
+		// traces of isolated transactions
+		recCt := recTrace.CallTraces[currIdx]
+		subCt := subTrace.CallTraces[currIdx]
+
+		// check subset of SHA3 hashes for redundant or reordered SLOADs
+		if len(recCt.SHA3HashToIndex) > len(subCt.SHA3HashToIndex) {
+			return false
+		}
+		for h := range recCt.SHA3HashToIndex {
+			if _, ok := subCt.SHA3HashToIndex[h]; !ok {
+				return false
+			}
+		}
+
 		return true
 	}
+
 	return false
 }
 

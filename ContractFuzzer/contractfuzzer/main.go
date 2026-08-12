@@ -1,8 +1,8 @@
 package main
 
 import (
-	"github.com/ethereum/go-ethereum/ContractFuzzer/fuzz"
-	"github.com/ethereum/go-ethereum/ContractFuzzer/server"
+	"github.com/seonghojj/ContractFuzzer/fuzz"
+	"github.com/seonghojj/ContractFuzzer/server"
 	"flag"
 	"log"
 )

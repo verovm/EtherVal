@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	abi_gen "github.com/ethereum/go-ethereum/ContractFuzzer/abi"
+	abi_gen "github.com/seonghojj/ContractFuzzer/abi"
 )
 var (
 	error_log = "/list/error-line.log"

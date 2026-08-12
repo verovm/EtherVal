@@ -29,6 +29,7 @@ var ReplayCommand = &cli.Command{
 		research.SkipCreateTxsFlag,
 		research.SubstateDirFlag,
 		research.BlockSegmentFlag,
+		research.TxListFlag,
 	},
 	Description: `
 substate-cli replay executes transactions in the given block segment
@@ -36,8 +37,8 @@ and check output consistency for faithful replaying.`,
 	Category: "replay",
 }
 
-// replayTask replays a transaction substate
-func replayTask(block uint64, tx int, substate *research.Substate, taskPool *research.SubstateTaskPool) error {
+// ReplayEVM performs a common replay logic up to Finalise and returns the necessary components.
+func ReplayEVM(block uint64, tx int, substate *research.Substate) (*state.StateDB, *vm.BlockContext, *core.Message, *core.ExecutionResult, error) {
 	// InputAlloc
 	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabase(rawdb.NewMemoryDatabase()), nil)
 	statedb.LoadSubstate(substate)
@@ -72,7 +73,7 @@ func replayTask(block uint64, tx int, substate *research.Substate, taskPool *res
 
 	result, err := core.ApplyMessage(evm, txMessage, gaspool)
 	if err != nil {
-		return err
+		return nil, nil, nil, nil, err
 	}
 
 	if chainConfig.IsByzantium(blockNumber) {
@@ -80,6 +81,16 @@ func replayTask(block uint64, tx int, substate *research.Substate, taskPool *res
 	} else {
 		// No need for root hash, call  Finalise instead of IntermediateRoot
 		statedb.Finalise(chainConfig.IsEIP158(blockNumber))
+	}
+
+	return statedb, &blockContext, txMessage, result, nil
+}
+
+// replayTask replays a transaction substate
+func replayTask(block uint64, tx int, substate *research.Substate, taskPool *research.SubstateTaskPool) error {
+	statedb, blockContext, txMessage, result, err := ReplayEVM(block, tx, substate)
+	if err != nil {
+		return err
 	}
 
 	rr := &research.ResearchReceipt{}

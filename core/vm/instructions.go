@@ -252,6 +252,9 @@ func opKeccak256(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) (
 		evm.StateDB.AddPreimage(interpreter.hasherBuf, data)
 	}
 
+	// substrate-evm-trace: add SHA3 instruction return values
+	interpreter.evm.StateDB.(*state.StateDB).ResearchEVMCallTrace.AddSHA3InstRet(interpreter.hasherBuf)
+
 	size.SetBytes(interpreter.hasherBuf[:])
 	return nil, nil
 }
@@ -539,13 +542,14 @@ func opSstore(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]b
 		return nil, ErrWriteProtection
 	}
 
+	loc := scope.Stack.pop()
+	val := scope.Stack.pop()
+
 	// substrate-evm-trace: call AddSstoreTrace to trace address, pc of SSTORE
-	t := fmt.Sprintf("address %s, pc: %v", scope.Contract.Address().Hex(), *pc)
+	t := fmt.Sprintf("%s,%s,%s", scope.Contract.Address().Hex(), loc.Hex(), val.Hex())
 	interpreter.evm.StateDB.(*state.StateDB).ResearchEVMTrace.AddSstoreTrace(t)
 	interpreter.evm.StateDB.(*state.StateDB).ResearchEVMTrace.IncSstoreCount()
 
-	loc := scope.Stack.pop()
-	val := scope.Stack.pop()
 	if checkEMI {
 		fmt.Printf("EVM: address %s, loc: %s, value: %s, depth: %d, pc: %v\n", scope.Contract.Address().Hex(), loc.Hex(), common.Hash(val.Bytes32()).Hex(), interpreter.evm.depth, *pc)
 	}
@@ -560,7 +564,7 @@ func opJump(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byt
 	pos := scope.Stack.pop()
 
 	// substrate-evm-trace: call AddJumpInstPosTarget to trace position of JUMP and target JUMPDEST
-	interpreter.evm.StateDB.(*state.StateDB).ResearchEVMCallTrace.AddJumpInstPosTarget(*pc, pos)
+	// interpreter.evm.StateDB.(*state.StateDB).ResearchEVMCallTrace.AddJumpInstPosTarget(*pc, pos)
 
 	if !scope.Contract.validJumpdest(&pos) {
 		return nil, ErrInvalidJump
@@ -576,7 +580,7 @@ func opJumpi(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]by
 	pos, cond := scope.Stack.pop(), scope.Stack.pop()
 	if !cond.IsZero() {
 		// substrate-evm-trace: trace target JUMPDEST when JUMPI reads non-zero and jumps
-		interpreter.evm.StateDB.(*state.StateDB).ResearchEVMCallTrace.AddJumpInstPosTarget(*pc, pos)
+		// interpreter.evm.StateDB.(*state.StateDB).ResearchEVMCallTrace.AddJumpInstPosTarget(*pc, pos)
 
 		if !scope.Contract.validJumpdest(&pos) {
 			return nil, ErrInvalidJump
@@ -584,7 +588,7 @@ func opJumpi(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]by
 		*pc = pos.Uint64() - 1 // pc will be increased by the interpreter loop
 	} else {
 		// substrate-evm-trace: trace target JUMPDEST when JUMPI reads zero and doesn't jump
-		interpreter.evm.StateDB.(*state.StateDB).ResearchEVMCallTrace.AddJumpInstPosTarget(*pc, *uint256.NewInt(*pc))
+		// interpreter.evm.StateDB.(*state.StateDB).ResearchEVMCallTrace.AddJumpInstPosTarget(*pc, *uint256.NewInt(*pc))
 	}
 	return nil, nil
 }

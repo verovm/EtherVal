@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"runtime/debug"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,19 +27,62 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
+// Empty result if TAC is not found
+const TACNotFoundEmptyResult = true
+
+// Use gas values from GasInstRet for GAS instructions
+const TACUseGasTrace = true
+
+// TAC interpreter's PHI policy flag
+const TACPhiPolicy = TACPhiPolicy_ExecAll
+
+// Skip a contract if it resulted a timeout transaction
+const SkipTACTimeoutContracts = false
+
+// Deny execution of ambiguous jumps
+const TACDenyAmbiJump = false
+
+type TACPhiPolicyType int
+
+const (
+	TACPhiPolicy_ExecAll TACPhiPolicyType = iota // Default: Execute all PHI instructions
+
+	TACPhiPolicy_DenyAll     // Deny all PHI instructions
+	TACPhiPolicy_DenyAmbiAll // Deny all ambiguous PHI instructions
+	TACPhiPolicy_DenyAmbiDyn // Deny PHI instructions with ambiguous choices at runtime
+)
+
+var TACTimeoutContractSet = sync.Map{}
+
+func IsTACTimeoutContract(code []byte) bool {
+	codehash := research.CodeHash(code)
+	_, exist := TACTimeoutContractSet.Load(codehash)
+	return exist
+}
+
+func AddTACTimeoutContract(code []byte) {
+	codehash := research.CodeHash(code)
+	TACTimeoutContractSet.Store(codehash, struct{}{})
+}
+
 type TACProgram = tac_parser.TACProgram
 type TACFunction = tac_parser.TACFunction
 
 var (
-	ErrTACThrow       = errors.New("TAC THROW statement was executed")
-	ErrTACNoTac       = errors.New("no TAC found in substratedir")
-	ErrTACIllPhiExec  = errors.New("TAC ILLPHI statement was executed")
-	ErrTACIllJump     = errors.New("illegal jump destination to nonexistent TAC block")
-	ErrTACNoCallTrace = errors.New("no next call trace found")
-	ErrTACNoGasTrace  = ErrDeltaNoGasFound
-	ErrTACTimeout     = errors.New("TAC interpreter reached transaction timeout")
-	ErrTACPanic       = errors.New("TAC interpreter raised unexpected runtime panic")
-	ErrTACParseError  = errors.New("TAC parsing error")
+	ErrTACThrow = errors.New("TAC THROW statement was executed")
+
+	ErrTACNoTac      = errors.New("no TAC found in substratedir")
+	ErrTACIllPhiExec = errors.New("TAC ILLPHI statement was executed")
+	ErrTACIllJump    = errors.New("illegal jump destination to nonexistent TAC block")
+	ErrTACAmbiJump   = errors.New("ambiguous jump destination to multiple TAC blocks")
+
+	ErrTACNoCallTrace   = errors.New("no next call trace found")
+	ErrTACNoGasTrace    = ErrDeltaNoGasFound
+	ErrTACMissingGasSem = errors.New("missing gas semantics for TAC GAS instructions")
+
+	ErrTACTimeout    = errors.New("TAC interpreter reached transaction timeout")
+	ErrTACPanic      = errors.New("TAC interpreter raised unexpected runtime panic")
+	ErrTACParseError = errors.New("TAC parsing error")
 )
 
 // check if the error return should be treated as global error (TAC error)
@@ -45,9 +90,13 @@ var (
 // ErrTACThrow is not a TAC global error - it is raised only for a (nested) contract.
 // Contract caller will set
 func IsTACGlobalError(err error) bool {
-	return err == ErrTACNoTac || err == ErrTACIllPhiExec ||
-		err == ErrTACIllJump || err == ErrTACNoCallTrace || err == ErrTACNoGasTrace ||
-		err == ErrTACTimeout || err == ErrTACPanic || err == ErrTACParseError
+	switch err {
+	case ErrTACNoTac, ErrTACIllPhiExec, ErrTACIllJump, ErrTACAmbiJump,
+		ErrTACNoCallTrace, ErrTACNoGasTrace, ErrTACMissingGasSem,
+		ErrTACTimeout, ErrTACPanic, ErrTACParseError:
+		return true
+	}
+	return false
 }
 
 var (
@@ -89,7 +138,7 @@ type TACInterpreter struct {
 	evm        *EVM
 	jumptable  *TACJumpTable
 	hasher     crypto.KeccakState // Keccak256 hasher instance shared across opcodes
-	hasherBuf  common.Hash        // Keccak256 hasher result array shared aross opcodes
+	hasherBuf  common.Hash        // Keccak256 hasher result array shared across opcodes
 	readOnly   bool               // Whether to throw on stateful modifications
 	returnData []byte             // Last CALL's return data for subsequent reuse
 	frames     []*TACFrame
@@ -97,6 +146,8 @@ type TACInterpreter struct {
 	abort atomic.Int32
 
 	Delta *DeltaSemantics
+
+	deviationCheck bool
 }
 
 const (
@@ -126,13 +177,13 @@ func (in *TACInterpreter) GetProg() *TACProgram {
 }
 
 func (in *TACInterpreter) CanRun([]byte) bool {
-	//TODO: only runs code that can be analysized by Gigahorse
+	//TODO: only runs code that can be analyzed by Gigahorse
 	return true
 }
 
-const TACResultHeader = "md5,addr,func,callTAC,callEVM,sstoreTAC,sstoreEVM,maxInst,tacInst"
+const TACInputHeader = "md5,addr,func"
 
-func TACResultRow(code []byte, addr common.Address, input []byte, delta *DeltaSemantics) string {
+func TACInputRow(code []byte, addr common.Address, input []byte) string {
 	funcHex := "0x"
 	if len(input) > 4 {
 		funcHex += hex.EncodeToString(input[0:4])
@@ -140,16 +191,60 @@ func TACResultRow(code []byte, addr common.Address, input []byte, delta *DeltaSe
 		funcHex += hex.EncodeToString(input)
 	}
 
+	row := strings.Join([]string{getMD5(code), addr.Hex(), funcHex}, ",")
+	return row
+}
+
+const TACResultHeader = TACInputHeader +
+	",callTAC,callEVM,sstoreTAC,sstoreEVM,maxInst,tacInst" +
+	",tacStop,tacFallStop" +
+	",tacJump,tacFallJump,tacAmbiJump" +
+	",tacThrow,tacFallThrow" +
+	",tacConst,tacReorConst" +
+	",tacPhi,tacReorPhi,tacAmbiPhi,tacAmbiPhiChoice"
+
+func TACResultRow(code []byte, addr common.Address, input []byte, delta *DeltaSemantics) string {
 	vals := []string{
-		getMD5(code),
-		addr.Hex(),
-		funcHex,
+		TACInputRow(code, addr, input),
+
 		fmt.Sprintf("%v", len(delta.SubstrateTrace.CallTraces)),
 		fmt.Sprintf("%v", len(delta.RecordedTrace.CallTraces)),
 		fmt.Sprintf("%v", delta.SubstrateTrace.SstoreCount),
 		fmt.Sprintf("%v", delta.RecordedTrace.SstoreCount),
-		fmt.Sprintf("%v", delta.MaxInstCount),
-		fmt.Sprintf("%v", delta.SubstrateInstCount),
+		fmt.Sprintf("%v", delta.TACMaxInstCount),
+		fmt.Sprintf("%v", delta.TACInstCount),
+
+		fmt.Sprintf("%v", delta.TACStopCount),
+		fmt.Sprintf("%v", delta.TACFallthroughStopCount),
+
+		fmt.Sprintf("%v", delta.TACJumpCount),
+		fmt.Sprintf("%v", delta.TACFallthroughJumpCount),
+		fmt.Sprintf("%v", delta.TACAmbiguousJumpCount),
+
+		fmt.Sprintf("%v", delta.TACThrowCount),
+		fmt.Sprintf("%v", delta.TACFallthroughThrowCount),
+
+		fmt.Sprintf("%v", delta.TACConstCount),
+		fmt.Sprintf("%v", delta.TACReorderConstCount),
+
+		fmt.Sprintf("%v", delta.TACPhiCount),
+		fmt.Sprintf("%v", delta.TACReorderPhiCount),
+		fmt.Sprintf("%v", delta.TACAmbiguousPhiCount),
+		fmt.Sprintf("%v", delta.TACAmbiguousPhiChoiceCount),
+	}
+	row := strings.Join(vals, ",")
+
+	return row
+}
+
+const TACDeviationHeader = TACInputHeader +
+	",deviated,deviationPoint"
+
+func TACDeviationRow(code []byte, addr common.Address, input []byte, delta *DeltaSemantics) string {
+	vals := []string{
+		TACInputRow(code, addr, input),
+		fmt.Sprintf("%v", delta.TACDeviation != ""),
+		delta.TACDeviation,
 	}
 	row := strings.Join(vals, ",")
 
@@ -168,6 +263,7 @@ func (in *TACInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		err      error
 	)
 	in.evm.depth++
+	in.Delta.SubstrateTrace.CallTraces[in.evm.Config.IsolationIndex].Depth = int32(in.evm.depth)
 	defer func() { in.evm.depth-- }()
 
 	// Make sure the readOnly is only set if we aren't in readOnly yet.
@@ -184,6 +280,11 @@ func (in *TACInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 	// Don't bother with the execution if there's no code.
 	if len(contract.Code) == 0 {
 		return nil, nil
+	}
+
+	if SkipTACTimeoutContracts && IsTACTimeoutContract(contract.Code) {
+		in.Delta.SubstrateErr = ErrTACTimeout
+		return nil, ErrTACTimeout
 	}
 
 	contract.Input = input
@@ -215,7 +316,7 @@ func (in *TACInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		doneChan := make(chan struct{}, 1)
 		go func() {
 			defer func() {
-				// When this.execute_func paniced
+				// When this.execute_func panic
 				if r := recover(); r != nil {
 					res = nil
 					err = ErrTACPanic
@@ -244,6 +345,12 @@ func (in *TACInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		res, err = in.execute_func(in.GetProg().Entry, NewContext(in.GetProg().Entry, nil))
 	}
 
+	if SkipTACTimeoutContracts {
+		if in.Delta.SubstrateErr == ErrTACTimeout || err == ErrTACTimeout {
+			AddTACTimeoutContract(contract.Code)
+		}
+	}
+
 	in.frames = in.frames[:len(in.frames)-1] //pop frame
 
 	if IsTACGlobalError(err) {
@@ -257,6 +364,8 @@ func NewTACInterpreter(evm *EVM, vmConfig Config) *TACInterpreter {
 	return &TACInterpreter{
 		evm:       evm,
 		jumptable: GetTACJumptable(),
+
+		deviationCheck: (vmConfig.EVMTrace != nil),
 
 		Delta: evm.Delta,
 	}
@@ -276,7 +385,7 @@ func (in *TACInterpreter) execute_func(f *TACFunction, ctx *TACContext) ([]byte,
 			res, err = nil, ErrOutOfGas
 		}
 
-		if in.Delta.MaxInstCount > 0 && in.Delta.SubstrateInstCount >= in.Delta.MaxInstCount {
+		if in.Delta.TACMaxInstCount > 0 && in.Delta.TACInstCount >= in.Delta.TACMaxInstCount {
 			in.Delta.SubstrateErr = ErrTACTimeout
 			in.abort.Store(TAC_ABORT_TIMEOUT)
 			in.evm.Cancel()
@@ -299,7 +408,12 @@ func (in *TACInterpreter) execute_func(f *TACFunction, ctx *TACContext) ([]byte,
 			return nil, fmt.Errorf("unexpected abort value (%v)", a)
 		}
 
-		in.Delta.SubstrateInstCount++
+		// panic when deviation point was detected
+		if in.deviationCheck && err == nil && in.evm.Delta.TACDeviation != "" {
+			panic(in.evm.Delta.TACDeviation)
+		}
+
+		in.Delta.TACInstCount++
 		operation := in.jumptable[ctx.get_inst(pc)]
 		if TraceTAC {
 			tmp_pc := pc
@@ -355,11 +469,19 @@ func (in *TACInterpreter) execute_func(f *TACFunction, ctx *TACContext) ([]byte,
 // THROW instruction in TAC corresponding to INVALID instruction in EVM
 func exec_throw(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
 	//this is a gigahorse exception
+	in.Delta.TACThrowCount++
+	if ctx.function.FallthroughThrowAddr[*pc] {
+		in.Delta.TACFallthroughThrowCount++
+	}
 	return nil, ErrTACThrow
 }
 
 // stop execution
 func exec_stop(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
+	in.Delta.TACStopCount++
+	if ctx.function.FallthroughStopAddr[*pc] {
+		in.Delta.TACFallthroughStopCount++
+	}
 	return nil, nil
 }
 
@@ -485,20 +607,19 @@ func exec_msize(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
 
 // remaining gas
 func exec_gas(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
-	// Read gas values from GasInstRet
-	const UseGasTrace = true
-
 	dest := ctx.get_var(ctx.get_inst(*pc + 1))
 	gas := in.GetContract().Gas
 
 	frame := in.GetFrame()
 
-	if UseGasTrace {
+	if TACUseGasTrace {
 		var gerr error
 		gas, gerr = GetGasRetInst(frame.recCallTrace, frame.subCallTrace)
 		if gerr != nil {
 			return nil, ErrTACNoGasTrace
 		}
+	} else {
+		return nil, ErrTACMissingGasSem
 	}
 
 	frame.subCallTrace.AddGasInstRet(gas)
@@ -647,6 +768,16 @@ func exec_sload(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
 
 // unconditional jump
 func exec_jump(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
+	in.Delta.TACJumpCount++
+	if ctx.function.FallthroughJumpAddr[*pc] {
+		in.Delta.TACFallthroughJumpCount++
+	}
+	if ctx.function.AmbiguousJumpAddr[*pc] {
+		in.Delta.TACAmbiguousJumpCount++
+		if TACDenyAmbiJump {
+			return nil, ErrTACAmbiJump
+		}
+	}
 	if ctx.get_inst(*pc+1) == -1 {
 		return nil, in.errInvalidJump()
 	}
@@ -655,6 +786,16 @@ func exec_jump(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
 }
 
 func exec_jump_var(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
+	in.Delta.TACJumpCount++
+	if ctx.function.FallthroughJumpAddr[*pc] {
+		in.Delta.TACFallthroughJumpCount++
+	}
+	if ctx.function.AmbiguousJumpAddr[*pc] {
+		in.Delta.TACAmbiguousJumpCount++
+		if TACDenyAmbiJump {
+			return nil, ErrTACAmbiJump
+		}
+	}
 	target := ctx.get_var(ctx.get_inst(*pc + 1))
 
 	function := ctx.Function()
@@ -998,6 +1139,16 @@ func exec_sha3(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
 		evm.StateDB.AddPreimage(in.hasherBuf, data)
 	}
 
+	// check deviation of TAC SHA3 compared to EVM trace
+	if in.evm.Config.EVMTrace != nil {
+		if in.evm.checkSHA3Deviation(in.evm.Config.IsolationIndex, in.hasherBuf) {
+			in.evm.Delta.TACDeviation = "Deviated in SHA3 at " + ctx.GetFuncBlockNames()
+		}
+	}
+
+	// substrate-evm-trace: add SHA3 instruction return values
+	in.GetFrame().subCallTrace.AddSHA3InstRet(in.hasherBuf)
+
 	dest.SetBytes(ctx.cycle, in.hasherBuf[:])
 	*pc += 4
 	return nil, nil
@@ -1037,11 +1188,19 @@ func exec_sstore(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
 		common.Hash(loc.val.Bytes32()), common.Hash(val.val.Bytes32()))
 	*pc += 3
 
+	// check deviation of TAC SSTORE compared to EVM trace
+	if in.evm.Config.EVMTrace != nil {
+		if in.evm.checkSstoreDeviation(in.GetContract().Address(), &loc.val, &val.val) {
+			in.evm.Delta.TACDeviation = "Deviated in SSTORE at " + ctx.GetFuncBlockNames()
+		}
+	}
+
 	if checkEMI {
 		fmt.Printf("TAC: address %s, loc: %s, value: %s, depth: %d, pc: %v\n", in.GetContract().Address().Hex(), loc.val.String(), common.Hash(val.val.Bytes32()).Hex(), in.evm.depth, *pc)
 	}
-	t := fmt.Sprintf("address %s, pc: %v", in.GetContract().Address().Hex(), *pc)
 
+	// t := fmt.Sprintf("address %s, pc: %v", in.GetContract().Address().Hex(), *pc)
+	t := fmt.Sprintf("%s,%s,%s", in.GetContract().Address().Hex(), loc.val.Hex(), val.val.Hex())
 	in.Delta.SubstrateTrace.AddSstoreTrace(t)
 	in.Delta.SubstrateTrace.IncSstoreCount()
 
@@ -1049,6 +1208,17 @@ func exec_sstore(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
 }
 
 func exec_jumpi(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
+	in.Delta.TACJumpCount++
+	if ctx.function.FallthroughJumpAddr[*pc] {
+		in.Delta.TACFallthroughJumpCount++
+	}
+	if ctx.function.AmbiguousJumpAddr[*pc] {
+		in.Delta.TACAmbiguousJumpCount++
+		if TACDenyAmbiJump {
+			return nil, ErrTACAmbiJump
+		}
+	}
+
 	target := ctx.get_inst(*pc + 1)
 	cond := ctx.get_var(ctx.get_inst(*pc + 2))
 	if !cond.val.IsZero() {
@@ -1063,6 +1233,16 @@ func exec_jumpi(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
 }
 
 func exec_jumpi_var(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
+	in.Delta.TACJumpCount++
+	if ctx.function.FallthroughJumpAddr[*pc] {
+		in.Delta.TACFallthroughJumpCount++
+	}
+	if ctx.function.AmbiguousJumpAddr[*pc] {
+		in.Delta.TACAmbiguousJumpCount++
+		if TACDenyAmbiJump {
+			return nil, ErrTACAmbiJump
+		}
+	}
 	target := ctx.get_var(ctx.get_inst(*pc + 1))
 	cond := ctx.get_var(ctx.get_inst(*pc + 2))
 
@@ -1219,6 +1399,16 @@ func exec_phi_start(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error
 	// phi should be executed in parallel, so we copy the whole value array (can be improved)
 	copiedRegister := ctx.registers
 	for i := 0; i < numOfPHI; i++ {
+		phiAddr := *pc
+		in.Delta.TACPhiCount++
+		if ctx.function.ReorderPhiAddr[phiAddr] {
+			in.Delta.TACReorderPhiCount++
+		}
+		if ctx.function.AmbiguousPhiAddr[phiAddr] {
+			in.Delta.TACAmbiguousPhiCount++
+
+		}
+
 		numOfChoice := ctx.get_inst(*pc + 1)
 		dest := ctx.get_var(ctx.get_inst(*pc + 2))
 		*pc += 3 // move to first choice
@@ -1233,6 +1423,23 @@ func exec_phi_start(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error
 				recentVar = choiceVar
 			}
 		}
+
+		if ctx.function.AmbiguousPhiChoice[phiAddr][recentIdx] {
+			in.Delta.TACAmbiguousPhiChoiceCount++
+		}
+
+		if TACPhiPolicy == TACPhiPolicy_DenyAll {
+			return nil, ErrTACIllPhiExec
+		}
+		if TACPhiPolicy == TACPhiPolicy_DenyAmbiAll &&
+			ctx.function.AmbiguousPhiAddr[phiAddr] {
+			return nil, ErrTACIllPhiExec
+		}
+		if TACPhiPolicy == TACPhiPolicy_DenyAmbiDyn &&
+			ctx.function.AmbiguousPhiChoice[phiAddr][recentIdx] {
+			return nil, ErrTACIllPhiExec
+		}
+
 		dest.Set(ctx.cycle, &copiedRegister[recentIdx].val)
 		*pc += numOfChoice
 	}
@@ -1241,7 +1448,9 @@ func exec_phi_start(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error
 }
 
 func exec_block_flag(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
-	// This has no effect
+	// update current block flag index in context for debugging
+	ctx.block_flag = *pc
+
 	*pc += 1
 	return nil, nil
 }
@@ -1297,6 +1506,13 @@ func makeTACLog(size int) func(pc *int, in *TACInterpreter, ctx *TACContext) ([]
 			fmt.Println("\nLOG Data:", hex.EncodeToString(d))
 		}
 
+		// check deviation of TAC LOG compared to EVM trace
+		if in.evm.Config.EVMTrace != nil && in.evm.Delta.TACDeviation == "" {
+			if in.evm.checkLogDeviation(topics, d) {
+				in.evm.Delta.TACDeviation = "Deviated in LOG" + strconv.Itoa(size) + " at " + ctx.GetFuncBlockNames()
+			}
+		}
+
 		in.Delta.SubstrateTrace.AddEventTrace(topics, d)
 
 		in.evm.StateDB.AddLog(&types.Log{
@@ -1346,6 +1562,13 @@ func exec_call(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
 
 	if gas > in.Delta.MaxGas {
 		return nil, ErrOutOfGas
+	}
+
+	// check deviation of TAC CALL compared to EVM trace
+	if in.evm.Config.EVMTrace != nil {
+		if in.evm.checkCallDeviation(toAddr, args, value, false) {
+			in.evm.Delta.TACDeviation = "Deviated in CALL at " + ctx.GetFuncBlockNames()
+		}
 	}
 
 	ret, _, err := in.evm.Call(in.GetContract(), toAddr, args, gas, value)
@@ -1413,6 +1636,13 @@ func exec_callcode(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error)
 		return nil, ErrOutOfGas
 	}
 
+	// check deviation of TAC CALLCODE compared to EVM trace
+	if in.evm.Config.EVMTrace != nil {
+		if in.evm.checkCallDeviation(toAddr, args, value, false) {
+			in.evm.Delta.TACDeviation = "Deviated in CALLCODE at " + ctx.GetFuncBlockNames()
+		}
+	}
+
 	ret, _, err := in.evm.CallCode(in.GetContract(), toAddr, args, gas, value)
 
 	if err != nil {
@@ -1473,6 +1703,13 @@ func exec_delegatecall(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, er
 		return nil, ErrOutOfGas
 	}
 
+	// check deviation of TAC DELEGATECALL compared to EVM trace
+	if in.evm.Config.EVMTrace != nil {
+		if in.evm.checkCallDeviation(toAddr, args, in.GetContract().value, true) {
+			in.evm.Delta.TACDeviation = "Deviated in DELEGATECALL at " + ctx.GetFuncBlockNames()
+		}
+	}
+
 	ret, _, err := in.evm.DelegateCall(in.GetContract(), toAddr, args, gas)
 
 	if err != nil {
@@ -1528,6 +1765,13 @@ func exec_staticcall(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, erro
 
 	if gas > in.Delta.MaxGas {
 		return nil, ErrOutOfGas
+	}
+
+	// check deviation of TAC STATICCALL compared to EVM trace
+	if in.evm.Config.EVMTrace != nil {
+		if in.evm.checkCallDeviation(toAddr, args, new(uint256.Int), false) {
+			in.evm.Delta.TACDeviation = "Deviated in STATICCALL at " + ctx.GetFuncBlockNames()
+		}
 	}
 
 	ret, _, err := in.evm.StaticCall(in.GetContract(), toAddr, args, gas)
@@ -1751,6 +1995,10 @@ func exec_returnprivate(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, e
 }
 
 func exec_const(pc *int, in *TACInterpreter, ctx *TACContext) ([]byte, error) {
+	in.Delta.TACConstCount++
+	if ctx.function.ReorderConstAddr[*pc] {
+		in.Delta.TACReorderConstCount++
+	}
 	// Update cycle for PHI selection
 	c := ctx.get_var(ctx.get_inst(*pc + 1))
 	c.UpdateCycle(ctx.cycle)
@@ -1766,7 +2014,7 @@ func (in *TACInterpreter) checkOutOfGas() bool {
 		in.Delta.AllocCount--
 	}
 
-	if in.Delta.CheckOutOfGas() {
+	if in.Delta.CheckOutOfGas(in.evm.Config.IsolationIndex) {
 		in.abort.Store(TAC_ABORT_OUTOFGAS)
 		return true
 	}

@@ -32,8 +32,8 @@ import (
 	lru "github.com/hashicorp/golang-lru"
 	"github.com/hashicorp/golang-lru/simplelru"
 	"github.com/holiman/uint256"
-	"github.com/ethereum/go-ethereum/substrate_parser/ast"
-	"github.com/ethereum/go-ethereum/substrate_parser/parser"
+	"github.com/seonghojj/substrate_parser/ast"
+	"github.com/seonghojj/substrate_parser/parser"
 )
 
 // ContractRef is a reference to the contract's backing object

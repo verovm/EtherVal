@@ -104,18 +104,29 @@ func run(evm *EVM, contract *Contract, input []byte, readOnly bool) ([]byte, err
 			// but it is still okay because we only use len(CallTraces)
 			code := contract.Code
 			addr := contract.Address()
+
+			emptyResRow := false
 			if len(code) == 0 {
-				// Empty result for empty code
-				evm.Delta.SubstrateResult = ""
+				emptyResRow = true
 			} else if _, isPrecompile := evm.precompile(addr); isPrecompile {
-				// Empty result for precompiles
+				emptyResRow = true
+			} else if TACNotFoundEmptyResult && err == ErrTACNoTac {
+				emptyResRow = true
+			}
+
+			if emptyResRow {
 				evm.Delta.SubstrateResult = ""
-			} else if err == ErrTACNoTac {
-				// Empty result for no TAC found
-				evm.Delta.SubstrateResult = ""
-			} else {
-				// Non-empty result for other cases
+			} else if evm.Config.EVMTrace == nil {
 				evm.Delta.SubstrateResult = TACResultRow(code, addr, input, evm.Delta)
+			} else {
+				// compare the traces and check remaining deviation points
+				if evm.Delta.TACDeviation == "" {
+					msg, exist := evm.CheckRemainingDeviation(evm.Config.IsolationIndex)
+					if exist {
+						evm.Delta.TACDeviation = "Deviated by remaining " + msg
+					}
+				}
+				evm.Delta.SubstrateResult = TACDeviationRow(code, addr, input, evm.Delta)
 			}
 
 			if IsTACGlobalError(err) {
@@ -286,6 +297,7 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 	}(sdb.ResearchEVMCallTrace)
 	// store depth, ret, and err in current CALL trace when return
 	sdb.ResearchEVMCallTrace = sdb.ResearchEVMTrace.NextCallTrace()
+	sdb.ResearchEVMCallTrace.CallGas = gas
 	defer func(currCt *research.EVMCallTrace) {
 		currCt.Callee = addr
 		currCt.CodeAddr = addr
@@ -396,6 +408,7 @@ func (evm *EVM) CallCode(caller ContractRef, addr common.Address, input []byte, 
 	}(sdb.ResearchEVMCallTrace)
 	// store depth, ret, and err in current CALL trace when return
 	sdb.ResearchEVMCallTrace = sdb.ResearchEVMTrace.NextCallTrace()
+	sdb.ResearchEVMCallTrace.CallGas = gas
 	defer func(currCt *research.EVMCallTrace) {
 		currCt.Callee = caller.Address()
 		currCt.CodeAddr = addr
@@ -467,6 +480,7 @@ func (evm *EVM) DelegateCall(caller ContractRef, addr common.Address, input []by
 	}(sdb.ResearchEVMCallTrace)
 	// store depth, ret, and err in current CALL trace when return
 	sdb.ResearchEVMCallTrace = sdb.ResearchEVMTrace.NextCallTrace()
+	sdb.ResearchEVMCallTrace.CallGas = gas
 	defer func(currCt *research.EVMCallTrace) {
 		currCt.Callee = caller.Address()
 		currCt.CodeAddr = addr
@@ -533,6 +547,7 @@ func (evm *EVM) StaticCall(caller ContractRef, addr common.Address, input []byte
 	}(sdb.ResearchEVMCallTrace)
 	// store depth, ret, and err in current CALL trace when return
 	sdb.ResearchEVMCallTrace = sdb.ResearchEVMTrace.NextCallTrace()
+	sdb.ResearchEVMCallTrace.CallGas = gas
 	defer func(currCt *research.EVMCallTrace) {
 		currCt.Callee = addr
 		currCt.CodeAddr = addr
@@ -719,6 +734,7 @@ func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *uint2
 	}(sdb.ResearchEVMCallTrace)
 	// store depth, ret, and err in current CALL trace when return
 	sdb.ResearchEVMCallTrace = sdb.ResearchEVMTrace.NextCallTrace()
+	sdb.ResearchEVMCallTrace.CallGas = gas
 	defer func(currCt *research.EVMCallTrace) {
 		currCt.Callee = contractAddr
 		currCt.CodeAddr = common.Address{}
@@ -750,6 +766,7 @@ func (evm *EVM) Create2(caller ContractRef, code []byte, gas uint64, endowment *
 	}(sdb.ResearchEVMCallTrace)
 	// store depth, ret, and err in current CALL trace when return
 	sdb.ResearchEVMCallTrace = sdb.ResearchEVMTrace.NextCallTrace()
+	sdb.ResearchEVMCallTrace.CallGas = gas
 	defer func(currCt *research.EVMCallTrace) {
 		currCt.Callee = contractAddr
 		currCt.CodeAddr = common.Address{}

@@ -3,6 +3,7 @@ package vm
 import (
 	"fmt"
 	"math/big"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/research"
 	"github.com/ethereum/go-ethereum/tac_parser"
@@ -67,6 +68,19 @@ func NewContext(f *tac_parser.TACFunction, args *[]uint256.Int) *TACContext {
 	}
 
 	return ctx
+}
+
+func (ctx *TACContext) GetFuncBlockNames() string {
+
+	fname := ctx.function.Name
+	if idx := strings.IndexAny(fname, ",("); idx != -1 {
+		fname = fname[:idx]
+	}
+	fname = strings.TrimSpace(fname)
+
+	bname := ctx.function.BlockByIndex[ctx.block_flag]
+
+	return "func " + fname + " block " + bname
 }
 
 func (ctx *TACContext) get_var(idx int) *TACRegister {

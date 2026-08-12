@@ -6,7 +6,7 @@ package parser
 import __yyfmt__ "fmt"
 
 //line parser.go.y:2
-import . "github.com/ethereum/go-ethereum/substrate_parser/ast"
+import . "github.com/seonghojj/substrate_parser/ast"
 
 //line parser.go.y:38
 type ItemSymType struct {

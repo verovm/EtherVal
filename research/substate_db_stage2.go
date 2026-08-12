@@ -31,6 +31,13 @@ var (
 	}
 	contractIso = false
 
+	IsolationIndexFlag = &cli.IntFlag{
+		Name:  "iso-index",
+		Usage: "The index of transaction for isolated execution, only effective with --iso-emi=true",
+		Value: -1,
+	}
+	isoIndex = -1
+
 	DebugSubstrateFlag = &cli.BoolFlag{
 		Name:  "debug",
 		Usage: "Output detailed information for debugging EMI",
@@ -50,6 +57,18 @@ var (
 		Usage: "Skip slow txs with more calls than the slow-tx-calls threshold",
 		Value: skipSlowTxs,
 	}
+
+	SkipInternalTxsFlag = &cli.BoolFlag{
+		Name:  "skip-internal-txs",
+		Usage: "Skip per-contract validation of internal txs, only effective with --iso-emi=true",
+	}
+	skipInternalTxs = false
+
+	RunOutOfGasFlag = &cli.BoolFlag{
+		Name:  "out-of-gas",
+		Usage: "Execute transaction containing out-of-gas error",
+	}
+	runOutOfGas = false
 
 	FuzzNFlag = &cli.IntFlag{
 		Name:  "fuzz-num",
@@ -101,6 +120,9 @@ func GetSubstrateDir() string {
 func GetContractIso() bool {
 	return contractIso
 }
+func GetIsoIndex() int {
+	return isoIndex
+}
 func GetDebugFlag() bool {
 	return debugSubstrate
 }
@@ -111,6 +133,12 @@ func GetSlowTxCalls() int {
 
 func GetSkipSlowTxs() bool {
 	return skipSlowTxs
+}
+func GetSkipInternalTxs() bool {
+	return skipInternalTxs
+}
+func GetRunOutOfGas() bool {
+	return runOutOfGas
 }
 
 func GetFuzzNum() int {

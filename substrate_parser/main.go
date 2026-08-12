@@ -5,8 +5,8 @@ import (
    "strings"
    "fmt"
 
-   "github.com/ethereum/go-ethereum/substrate_parser/parser"
-   "github.com/ethereum/go-ethereum/substrate_parser/ast"
+   "github.com/seonghojj/substrate_parser/parser"
+   "github.com/seonghojj/substrate_parser/ast"
 )
 
 func visitAST(l *parser.Lexer, w ast.Worker) {

@@ -12,8 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	//   abi_gen "github.com/ethereum/go-ethereum/ContractFuzzer/abi"
-	"github.com/ethereum/go-ethereum/substrate_parser/ast"
+	//   abi_gen "github.com/seonghojj/ContractFuzzer/abi"
+	"github.com/seonghojj/substrate_parser/ast"
 )
 
 var doFuzz = false

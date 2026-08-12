@@ -14,7 +14,7 @@ import (
 	"sync"
 	"strconv"
 	"time"
-	fuzz "github.com/ethereum/go-ethereum/ContractFuzzer/fuzz"
+	fuzz "github.com/seonghojj/ContractFuzzer/fuzz"
 )
 var(
 	logWriter *os.File

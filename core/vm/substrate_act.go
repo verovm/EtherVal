@@ -13,7 +13,7 @@ import (
 
 	"github.com/holiman/uint256"
 
-	"github.com/ethereum/go-ethereum/substrate_parser/ast"
+	"github.com/seonghojj/substrate_parser/ast"
 
 	"fmt"
 	"sync/atomic"
@@ -203,7 +203,7 @@ func (in *SubstrateInterpreter) ActEventDecl(n *ast.EventDeclNode) ast.Value {
 		}
 	}
 	sig += args + ")"
-	e := eventDef{eventId: n.Id.Val, args: args, signature: in.getHash([]byte(sig)).Hex()}
+	e := eventDef{eventId: n.Id.Val, args: args, signature: in.getHash([]byte(sig), false).Hex()}
 	in.framePtr.eventList = append(in.framePtr.eventList, e)
 
 	return NodeValue{}
@@ -262,6 +262,14 @@ func (in *SubstrateInterpreter) ActFormalArgList(l *ast.FormalArgList) ast.Value
 				//	println(mapping[arg.kind])
 				//}
 				in.Panic(fmt.Sprintf("Number of formal args does not match: %d %d", len(l.List), len(in.framePtr.passedArgs)), l, true)
+			}
+			if !useDeltaProp {
+				for i := range l.List {
+					passedType := in.getTypeString(in.framePtr.passedArgs[i])
+					if types[i] != passedType {
+						in.Panic("Wrong type propagation in internal calls", l, true)
+					}
+				}
 			}
 			in.setVariableList(NodeValue{value: argIds}, NodeValue{kind: ValueExprList, value: in.framePtr.passedArgs})
 		}
@@ -627,11 +635,12 @@ func (in *SubstrateInterpreter) ActEmitStmt(n *ast.EmitStmtNode) ast.Value {
 	in.preAct(n)
 	defer func() { in.framePtr.actDepth-- }()
 
+	in.checkOutOfGas()
 	defer func() {
 		in.checkOutOfGas()
 	}()
 
-	if useDelta {
+	if useDeltaLOG {
 		if in.Delta.EventCount() == len(in.Delta.RecordedTrace.EventTraces) {
 			in.Panic("event number does not match: "+strconv.Itoa(in.Delta.EventCount())+" "+strconv.Itoa(len(in.Delta.RecordedTrace.EventTraces)), n, false)
 		}
@@ -669,15 +678,15 @@ func (in *SubstrateInterpreter) ActEmitStmt(n *ast.EmitStmtNode) ast.Value {
 		exprList = in.ActExpressionList(event.ExprList).(NodeValue)
 	}
 
-	recordedEvent := in.Delta.RecordedTrace.EventTraces[in.Delta.EventCount()]
-	topicSize := len(recordedEvent.Topics)
+	topicSize := 1
+	if useDeltaLOG {
+		recordedEvent := in.Delta.RecordedTrace.EventTraces[in.Delta.EventCount()]
+		topicSize = len(recordedEvent.Topics)
+	}
 	topics := make([]common.Hash, topicSize)
 	args := in.getVariableList(exprList)
 
 	topics[0] = common.HexToHash(eventId)
-	if !useDelta {
-		topicSize = 1
-	}
 	for i := 0; i < topicSize-1; i++ {
 		tmp := in.getUint256(args[i]).Bytes32()
 		topics[i+1] = common.BytesToHash(tmp[:])
@@ -735,10 +744,19 @@ func (in *SubstrateInterpreter) ActEmitStmt(n *ast.EmitStmtNode) ast.Value {
 		in.Panic("pack error: "+str, in.currNode, false)
 	}
 
-	if useDelta {
+	if useDeltaLOG {
 		//TODO: why sometime recorded event data is not 32-byte word size
+		recordedEvent := in.Delta.RecordedTrace.EventTraces[in.Delta.EventCount()]
 		if len(packedArgs) > len(recordedEvent.Data) {
 			packedArgs = packedArgs[:len(recordedEvent.Data)]
+		}
+	}
+
+	// check deviation of LOG compared to EVM trace
+	if in.evm.Config.EVMTrace != nil {
+		if in.evm.checkLogDeviation(topics, packedArgs) {
+			line, _ := in.currNode.GetPos()
+			in.Panic("Deviated in LOG at line "+strconv.Itoa(line), in.currNode, false)
 		}
 	}
 
@@ -1108,6 +1126,8 @@ func (in *SubstrateInterpreter) ActRvalue(n *ast.RvalueNode) ast.Value {
 			bhash := uint256.NewInt(0).SetBytes(in.evm.Context.GetHash(n).Bytes())
 			return NodeValue{kind: ValueNum, value: bhash}
 		}
+		in.checkOutOfGas()
+
 		//get value and gas before call
 		callGas := uint64(2300)
 		callValue := uint256.NewInt(0)
@@ -1120,6 +1140,14 @@ func (in *SubstrateInterpreter) ActRvalue(n *ast.RvalueNode) ast.Value {
 				callGas = in.getUint256(gas).Uint64()
 			} else {
 				in.Panic("unexpected specifier", n, true)
+			}
+		}
+		if useDeltaGas {
+			if len(in.Delta.SubstrateTrace.CallTraces) < len(in.Delta.RecordedTrace.CallTraces) {
+				recordedGas := in.Delta.RecordedTrace.CallTraces[len(in.Delta.SubstrateTrace.CallTraces)].CallGas
+				if recordedGas != 0 {
+					callGas = recordedGas
+				}
 			}
 		}
 
@@ -1177,7 +1205,7 @@ func (in *SubstrateInterpreter) ActRvalue(n *ast.RvalueNode) ast.Value {
 				signature = signature[:len(signature)-1]
 			}
 			signature += ")"
-			hexSig := in.getHash([]byte(signature)).Bytes()
+			hexSig := in.getHash([]byte(signature), false).Bytes()
 			input = append(input, hexSig[0:4]...)
 			printDebug("call signature: "+signature, false)
 		}
@@ -1291,6 +1319,14 @@ func (in *SubstrateInterpreter) ActRvalue(n *ast.RvalueNode) ast.Value {
 			printDebug("MD5: "+getMD5(in.evm.StateDB.GetCode(callee)), true)
 		}
 
+		// check deviation of call compared to EVM trace
+		if in.evm.Config.EVMTrace != nil {
+			if in.evm.checkCallDeviation(callee, input, callValue, isDelegate) {
+				line, _ := in.currNode.GetPos()
+				in.Panic("Deviated in call at line "+strconv.Itoa(line), in.currNode, false)
+			}
+		}
+
 		var ret []byte
 		var err error
 		if isDelegate {
@@ -1298,6 +1334,8 @@ func (in *SubstrateInterpreter) ActRvalue(n *ast.RvalueNode) ast.Value {
 		} else {
 			ret, _, err = in.evm.Call(in.framePtr.contract, callee, input, callGas, callValue)
 		}
+		in.checkOutOfGas()
+
 		in.returnData = make([]byte, len(ret))
 		copy(in.returnData, ret)
 		printDebug("call return: "+hex.EncodeToString(ret), false)
@@ -1380,12 +1418,12 @@ func (in *SubstrateInterpreter) ActLvalue(n *ast.LvalueNode) ast.Value {
 					if structInfo, ok := in.framePtr.structInfo[typ]; ok {
 						index = index * structInfo.size
 					}
-					hash := in.getHash(bytes[:])
+					hash := in.getHash(bytes[:], true)
 					hash.Add(hash, uint256.NewInt(index))
 					v.SetValue(ValueStorRef, &storVar{n, typ, hash})
 				} else if stor.kind == ValueMapType {
 					a, b := in.getUint256(alloc[0]).Bytes32(), uint256.NewInt(0).Set(stor.index).Bytes32()
-					hash := in.getHash(append(a[:], b[:]...))
+					hash := in.getHash(append(a[:], b[:]...), true)
 					printDebug(hex.EncodeToString(b[:])+", "+hex.EncodeToString(a[:]), false)
 					printDebug(hex.EncodeToString(hash.Bytes()), false)
 					v.SetValue(ValueStorRef, &storVar{n, typ, hash})
@@ -1400,15 +1438,15 @@ func (in *SubstrateInterpreter) ActLvalue(n *ast.LvalueNode) ast.Value {
 				if strings.Contains(lval.typ, "mapping") { //mapping type
 					slot := lval.hash.Bytes32()
 					index := in.getUint256(alloc[0]).Bytes32()
-					hash := in.getHash(append(index[:], slot[:]...))
+					hash := in.getHash(append(index[:], slot[:]...), true)
 					typ := extractStorType(lval.typ, id.Type())
 					v.SetValue(ValueStorRef, &storVar{n, typ, hash})
 					printDebug(n.String()+": "+typ, false)
 				} else { //array type
 					index := in.getUint256(alloc[0])
-					hash := in.getHash(lval.hash.PaddedBytes(32))
+					hash := in.getHash(lval.hash.PaddedBytes(32), true)
 					hash.Add(hash, index)
-					//hash := in.getHash(index.Add(lval.hash, index).PaddedBytes(32))
+					//hash := in.getHash(index.Add(lval.hash, index).PaddedBytes(32), true)
 					typ := extractStorType(lval.typ, id.Type())
 					v.SetValue(ValueStorRef, &storVar{n, typ, hash})
 					printDebug(n.String()+": "+typ, false)
@@ -1418,10 +1456,10 @@ func (in *SubstrateInterpreter) ActLvalue(n *ast.LvalueNode) ast.Value {
 				lval := id.value.(*storStruct)
 				index := in.getUint256(alloc[0])
 				if strings.Contains(lval.fieldType, "mapping") { //field type is mapping
-					hash = in.getHash(append(index.PaddedBytes(32), lval.hash.PaddedBytes(32)...))
+					hash = in.getHash(append(index.PaddedBytes(32), lval.hash.PaddedBytes(32)...), true)
 					printDebug(n.String()+", "+hash.Hex(), false)
 				} else { //field type is array
-					hash = in.getHash(lval.hash.PaddedBytes(32))
+					hash = in.getHash(lval.hash.PaddedBytes(32), true)
 					hash.AddUint64(hash, index.Uint64())
 				}
 				v.SetValue(ValueStorRef, &storVar{n, "N/A", hash})
@@ -1683,7 +1721,7 @@ func (in *SubstrateInterpreter) ActLvalue(n *ast.LvalueNode) ast.Value {
 				}
 				v.SetValue(ValueStorRef, &storVar{n, "N/A", id.hash})
 			} else if n.Member == "data" {
-				v.SetValue(ValueNum, in.getHash(id.hash.Bytes()))
+				v.SetValue(ValueNum, in.getHash(id.hash.Bytes(), true))
 			} else {
 				fieldType := "uint256"
 				structInfo, ok := in.framePtr.structInfo[id.typ]
@@ -1707,7 +1745,7 @@ func (in *SubstrateInterpreter) ActLvalue(n *ast.LvalueNode) ast.Value {
 			if n.Member == "length" {
 				v.SetValue(ValueStorRef, &storVar{n, "N/A", ss.hash})
 			} else if n.Member == "data" {
-				v.SetValue(ValueStorRef, &storVar{n, "N/A", in.getHash(ss.obj.hash.Bytes())})
+				v.SetValue(ValueStorRef, &storVar{n, "N/A", in.getHash(ss.obj.hash.Bytes(), true)})
 			} else {
 				//TODO: implement the case like a.field0.field1
 				in.Panic("now implementing... (lvalType == ValueStruct)", n, false)
