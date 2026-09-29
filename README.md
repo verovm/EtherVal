@@ -29,7 +29,7 @@ from the `substate-cli --help` output.
      stat-tx-err                                Report statistics for OOG transactions
 ```
 
-Visit [Artifacts & Data from EtherVal](https://elc.yonsei.ac.kr/etherval/) for data artifacts from EtherVal
+Visit [EtherVal Replication Package](https://elc.yonsei.ac.kr/etherval/) for data artifacts from EtherVal
 including (1) EtherVal DBs with transaction states and Δ&#8209;semantics (EVM traces), (2) deployed EVM bytecode and decompiled TAC,
 and (3) validation configurations and experimental results.
 
