@@ -32,3 +32,16 @@ from the `substate-cli --help` output.
 Visit [Artifacts & Data from EtherVal](https://elc.yonsei.ac.kr/etherval/) for data artifacts from EtherVal
 including (1) EtherVal DBs with transaction states and Δ&#8209;semantics (EVM traces), (2) deployed EVM bytecode and decompiled TAC,
 and (3) validation configurations and experimental results.
+
+
+## Acknowledgements
+
+This work was supported by [Sonic Labs](https://www.soniclabs.com/) and under its former name Fantom
+Foundation, by the Institute of Information \& Communications Technology
+Planning \& Evaluation (IITP) funded by the Korean government (MSIT) under
+Grant No. 2021-0-00853, and by the Basic Science Research Program through the
+National Research Foundation of Korea (NRF) funded by the Ministry of Education
+under Grant No. 2022R1A6A3A13069093.
+
+We thank [Dedaub](https://dedaub.com/) for supporting us with the decompiled smart contracts of the
+initial 20M blocks of the Ethereum blockchain.
