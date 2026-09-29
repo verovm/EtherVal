@@ -4,7 +4,7 @@ This repository contains the code artifact for the following paper:
 
 **Seongho Jeong, Yeonsoo Kim, Xiaowen Hu, Junhao Zhu, Bernd Burgstaller, Bernhard Scholz.**\
 *EtherVal: Smart Contract Decompiler Validation for the Ethereum Blockchain.*
-(Under review.)
+(Accepted to IEEE Access.)
 
 EtherVal implementation extends the `substate-cli` command
 of [verovm/record-replay](https://github.com/verovm/record-replay).
